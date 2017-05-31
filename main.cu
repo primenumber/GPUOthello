@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cassert>
+#include "x86intrin.h"
 
 constexpr int threadsPerBlock = 128;
 constexpr int simdWidth = 4;
@@ -72,26 +73,47 @@ __constant__ ull mask1[4] = {
   0x0102040810204000ULL,
   0x0040201008040201ULL
 };
+constexpr ull mask1_host[4] = {
+  0x0080808080808080ULL,
+  0x7f00000000000000ULL,
+  0x0102040810204000ULL,
+  0x0040201008040201ULL
+};
 __constant__ ull mask2[4] = {
   0x0101010101010100ULL,
   0x00000000000000feULL,
   0x0002040810204080ULL,
   0x8040201008040200ULL
 };
+constexpr ull mask2_host[4] = {
+  0x0101010101010100ULL,
+  0x00000000000000feULL,
+  0x0002040810204080ULL,
+  0x8040201008040200ULL
+};
 
-__device__ ull flip(const Board &bd, int pos, int index) {
+__host__ __device__ ull flip(const Board &bd, int pos, int index) {
   ull om = opponent(bd);
   if (index) om &= 0x7E7E7E7E7E7E7E7EULL;
+#ifdef __CUDA_ARCH__
   ull mask = mask1[index] >> (63 - pos);
   ull outflank = (0x8000000000000000ULL >> __clzll(~om & mask)) & player(bd);
+#else
+  ull mask = mask1_host[index] >> (63 - pos);
+  ull outflank = (0x8000000000000000ULL >> _lzcnt_u64(~om & mask)) & player(bd);
+#endif
   ull flipped = (-outflank << 1) & mask;
+#ifdef __CUDA_ARCH__
   mask = mask2[index] << pos;
+#else
+  mask = mask2_host[index] << pos;
+#endif
   outflank = mask & ((om | ~mask) + 1) & player(bd);
   flipped |= (outflank - (outflank != 0)) & mask;
   return flipped;
 }
 
-__device__ ull flip_all(const Board &bd, int pos) {
+__host__ __device__ ull flip_all(const Board &bd, int pos) {
   return flip(bd, pos, 0) | flip(bd, pos, 1) | flip(bd, pos, 2) | flip(bd, pos, 3);
 }
 
@@ -103,15 +125,15 @@ struct Arrays {
   const size_t size;
 };
 
-__device__ bool get_next_node(Arrays &arys, const int node_index, const int simd_index, const int res, const int count) {
-  if (simd_index == 0) {
+__device__ bool get_next_node(Arrays &arys, const int res, const int count) {
+  if (threadIdx.x == 0) {
     arys.res_ary[arys.index] = res;
     arys.nodes_count[arys.index] = count;
   }
-  arys.index += (blockDim.x * gridDim.x) / simdWidth;
+  arys.index += blockDim.y * gridDim.y;
   if (arys.index >= arys.size) return true;
-  if (simd_index == 0) {
-    Node &root = nodes_stack[node_index][0];
+  if (threadIdx.x == 0) {
+    Node &root = nodes_stack[threadIdx.y][0];
     root.bd = arys.bd_ary[arys.index];
     root.alpha = -64;
     root.beta = 64;
@@ -121,9 +143,18 @@ __device__ bool get_next_node(Arrays &arys, const int node_index, const int simd
   return false;
 }
 
+__device__ void commit(int &stack_index) {
+  if (threadIdx.x == 0) {
+    Node &node = nodes_stack[threadIdx.y][stack_index];
+    Node &parent = nodes_stack[threadIdx.y][stack_index-1];
+    parent.update((node.passed ? -1 : 1) * node.alpha);
+  }
+  --stack_index;
+}
+
 __device__ void alpha_beta(Arrays &arys) {
-  int node_index = threadIdx.x / simdWidth;
-  int simd_index = threadIdx.x % simdWidth;
+  int node_index = threadIdx.y;
+  int simd_index = threadIdx.x;
   int stack_index = 0;
   int count = 1;
   while (true) {
@@ -139,7 +170,7 @@ __device__ void alpha_beta(Arrays &arys) {
             }
             --stack_index;
           } else {
-            if (get_next_node(arys, node_index, simd_index, -score(node.bd), count))
+            if (get_next_node(arys, -score(node.bd), count))
               return;
             count = 1; 
           }
@@ -154,26 +185,18 @@ __device__ void alpha_beta(Arrays &arys) {
         }
       } else {
         if (stack_index) {
-          Node &parent = nodes_stack[node_index][stack_index-1];
-          if (simd_index == 0) {
-            parent.update((node.passed ? -1 : 1) * node.alpha);
-          }
-          --stack_index;
+          commit(stack_index);
         } else {
-          if (get_next_node(arys, node_index, simd_index, (node.passed ? -1 : 1) * node.alpha, count))
+          if (get_next_node(arys, (node.passed ? -1 : 1) * node.alpha, count))
             return;
           count = 1; 
         }
       }
     } else if (node.alpha >= node.beta) {
       if (stack_index) {
-        Node &parent = nodes_stack[node_index][stack_index-1];
-        if (simd_index == 0) {
-          parent.update((node.passed ? -1 : 1) * node.alpha);
-        }
-        --stack_index;
+        commit(stack_index);
       } else {
-        if (get_next_node(arys, node_index, simd_index, (node.passed ? -1 : 1) * node.alpha, count))
+        if (get_next_node(arys, (node.passed ? -1 : 1) * node.alpha, count))
           return;
         count = 1; 
       }
@@ -203,7 +226,6 @@ __device__ void alpha_beta(Arrays &arys) {
     }
   }
 }
-
 struct Node2 {
   Board bd;
   ull puttable;
@@ -214,10 +236,10 @@ struct Node2 {
 };
 
 __global__ void search_noordering(const Board *bd_ary, int *res_ary, int *nodes_count, const size_t size) {
-  size_t index = (threadIdx.x + blockIdx.x * blockDim.x) / simdWidth;
+  size_t index = threadIdx.y + blockIdx.y * blockDim.y;
   if (index < size) {
-    int simd_index = threadIdx.x % simdWidth;
-    int node_index = threadIdx.x / simdWidth;
+    int simd_index = threadIdx.x;
+    int node_index = threadIdx.y;
     if (simd_index == 0) {
       Node &root = nodes_stack[node_index][0];
       root.bd = bd_ary[index];
@@ -236,20 +258,25 @@ __global__ void search_noordering(const Board *bd_ary, int *res_ary, int *nodes_
     alpha_beta(arys);
   }
 }
+
 /*
-__device__ ull puttable_bits(const Board &bd) {
+__host__ __device__ ull puttable_bits(const Board &bd) {
   ull result = 0;
-  for (ull empties = ~(bd.player | bd.opponent); empties;) {
+  for (ull empties = ~stones(bd); empties;) {
     ull bit = empties & -empties;
     empties ^= bit;
+#ifdef __CUDA_ARCH__
     if (flip_all(bd, __popcll(bit-1))) result |= bit;
+#else
+    if (flip_all(bd, _popcnt_u64(bit-1))) result |= bit;
+#endif
   }
   return result;
 }
 
 __device__ Board move(const Board &bd, const int pos) {
   ull flip_bits = flip_all(bd, pos);
-  return Board(bd.opponent ^ flip_bits, (bd.player ^ flip_bits) | (1 << pos));
+  return Board(opponent(bd) ^ flip_bits, (player(bd) ^ flip_bits) | (1 << pos));
 }
 
 struct NextBoard {
@@ -287,14 +314,14 @@ __device__ int alpha_beta_ordered(const Board bd, Node2 *nodes_buf, Arrays &arys
   Board top_board;
   int top_puttable = -1;
   int puttable_count = 0;
-  for (ull empties = ~(bd.player | bd.opponent); empties;) {
+  for (ull empties = ~stones(bd); empties;) {
     ull bit = empties & -empties;
     empties ^= bit;
     int pos = __ffsll(bit)-1;
     ull flip_bits = flip_all(bd, pos);
     if (flip_bits) {
       ++puttable_count;
-      Board next(bd.opponent ^ flip_bits, (bd.player ^ flip_bits) | bit);
+      Board next(opponent(bd) ^ flip_bits, (player(bd) ^ flip_bits) | bit);
       int puttable_count = __popcll(puttable_bits(next));
       if (puttable_count > top_puttable) {
         top_board = next;
@@ -303,14 +330,14 @@ __device__ int alpha_beta_ordered(const Board bd, Node2 *nodes_buf, Arrays &arys
     }
   }
   if (puttable_count > 0) {
-    nodes_buf[index] = {top_board, 0, 0, 0, 0};
+    nodes_buf[index] = {top_board, 0, 0, 0, false};
   } else {
-    nodes_buf[index] = move_pass(bd);
+    nodes_buf[index] = {move_pass(bd), 0, 0, 0, true};
   }
   __syncthreads();
   if (threadIdx.x == 0) {
     size_t offset = blockIdx.x * blockDim.x;
-    search_noordering<<<1, threadsPerBlock>>>(nodes_buf + offset, arys.res_ary + offset, arys.nodes_count + offset, blockDim.x);
+    search_noordering<<<1, threadsPerBlock>>>(&(nodes_buf[offset].bd), arys.res_ary + offset, arys.nodes_count + offset, blockDim.x);
     cudaDeviceSynchronize();
   }
   __syncthreads();
@@ -406,7 +433,9 @@ int main(int argc, char **argv) {
   cudaMemset(res_ary, 0, sizeof(int) * n);
   cudaMemset(nodes_count, 0, sizeof(int) * n);
   fputs("start solve\n", stderr);
-  search_noordering<<<2048, threadsPerBlock>>>(bd_ary, res_ary, nodes_count, n);
+  dim3 block(simdWidth, nodesPerBlock);
+  dim3 grid(1, 2048);
+  search_noordering<<<grid, block>>>(bd_ary, res_ary, nodes_count, n);
   cudaDeviceSynchronize();
   fputs("end solve\n", stderr);
   ull nodes_total = 0;
