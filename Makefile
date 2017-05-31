@@ -11,5 +11,5 @@ cosolve: $(OBJS)
 	$(NVCC) $(NVCCOPT) -c $< -o $@
 
 check: cosolve
-	./cosolve /data/othello/board54_true output54
-	diff -s ../issen/output54 output54
+	./cosolve prob54 output54
+	diff -s ans54 output54
