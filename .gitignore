@@ -1,0 +1,5 @@
+*.o
+prob*
+output*
+ans*
+cosolve
