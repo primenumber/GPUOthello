@@ -1,10 +1,14 @@
+NVCC=nvcc
 NVCCOPT=-std=c++11 --compiler-options -march=native -arch=sm_61 -m64 -O3 -rdc=true 
+OBJS=main.o solver.o board.o
 
-cosolve: main.cu
-	nvcc -o cosolve $(NVCCOPT) main.cu
+.SUFFIXES: .cpp .c .cu .o
 
-cosolve.cubin: main.cu
-	nvcc -o cosolve.cubin -cubin $(NVCCOPT) main.cu
+cosolve: $(OBJS)
+	nvcc -o cosolve $(NVCCOPT) $(OBJS)
+
+.cu.o:
+	$(NVCC) $(NVCCOPT) -c $< -o $@
 
 check: cosolve
 	./cosolve /data/othello/board54_true output54
